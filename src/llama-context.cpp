@@ -2823,6 +2823,338 @@ bool llama_opt_param_filter_all(const struct ggml_tensor * tensor, void * userda
     return true;
 }
 
+//
+// diffusion models (non-autoregressive generation)
+//
+
+struct llama_diffusion_params llama_diffusion_default_params() {
+    struct llama_diffusion_params params = {
+        /* .steps           = */ 256,
+        /* .temperature     = */ 0.0f,
+        /* .alg_temperature = */ 0.0f,
+        /* .algorithm       = */ LLAMA_DIFFUSION_ENTROPY,
+        /* .eps             = */ 1e-3f,
+        /* .seed            = */ LLAMA_DEFAULT_SEED,
+        /* .verbose         = */ false,
+    };
+    return params;
+}
+
+static void shift_logits_for_diffusion(float * logits, int32_t n_tokens, int32_t n_vocab) {
+    // Apple's key optimization: shift logits to align with input tokens
+    // logits = torch.cat([logits[:,:1], logits[:, :-1]], dim=1)
+    if (n_tokens <= 1) return;
+    
+    // Create temporary storage for first column
+    std::vector<float> first_col(n_vocab);
+    memcpy(first_col.data(), logits, n_vocab * sizeof(float));
+    
+    // Shift all columns left by one position
+    for (int32_t i = 0; i < n_tokens - 1; i++) {
+        memcpy(logits + i * n_vocab, logits + (i + 1) * n_vocab, n_vocab * sizeof(float));
+    }
+    
+    // Put first column at the end
+    memcpy(logits + (n_tokens - 1) * n_vocab, first_col.data(), n_vocab * sizeof(float));
+}
+
+static float calculate_token_confidence(
+        const float * token_logits,
+        int32_t n_vocab,
+        enum llama_diffusion_algorithm algorithm,
+        float temperature,
+        llama_token * sampled_token,
+        std::mt19937 & gen) {
+    
+    // Apply temperature scaling and calculate probabilities
+    std::vector<float> probs(n_vocab);
+    
+    if (temperature > 0) {
+        // Temperature scaling with softmax
+        float max_logit = *std::max_element(token_logits, token_logits + n_vocab);
+        float sum_exp = 0.0f;
+        
+        for (int32_t j = 0; j < n_vocab; j++) {
+            probs[j] = expf((token_logits[j] - max_logit) / temperature);
+            sum_exp += probs[j];
+        }
+        
+        for (int32_t j = 0; j < n_vocab; j++) {
+            probs[j] /= sum_exp;
+        }
+        
+        // Sample from distribution
+        std::discrete_distribution<> dist(probs.begin(), probs.end());
+        *sampled_token = dist(gen);
+    } else {
+        // Greedy: argmax
+        *sampled_token = std::distance(token_logits, std::max_element(token_logits, token_logits + n_vocab));
+        std::fill(probs.begin(), probs.end(), 0.0f);
+        probs[*sampled_token] = 1.0f;
+    }
+    
+    // Calculate confidence based on algorithm
+    float confidence = 0.0f;
+    
+    switch (algorithm) {
+        case LLAMA_DIFFUSION_ORIGIN:
+            // Random confidence
+            confidence = static_cast<float>(rand()) / RAND_MAX;
+            break;
+            
+        case LLAMA_DIFFUSION_MASKGIT_PLUS:
+            // Top-1 probability
+            confidence = probs[*sampled_token];
+            break;
+            
+        case LLAMA_DIFFUSION_TOPK_MARGIN:
+            {
+                // Top-1 minus Top-2
+                std::vector<float> sorted_probs = probs;
+                std::sort(sorted_probs.begin(), sorted_probs.end(), std::greater<float>());
+                confidence = sorted_probs[0] - (sorted_probs.size() > 1 ? sorted_probs[1] : 0.0f);
+            }
+            break;
+            
+        case LLAMA_DIFFUSION_ENTROPY:
+            // Negative entropy
+            confidence = 0.0f;
+            for (float p : probs) {
+                if (p > 1e-10f) {
+                    confidence += p * logf(p);
+                }
+            }
+            break;
+    }
+    
+    return confidence;
+}
+
+int32_t llama_diffusion_calculate_confidence(
+        const float * logits,
+        const llama_token * tokens,
+        int32_t n_tokens,
+        int32_t n_vocab,
+        llama_token mask_token_id,
+        enum llama_diffusion_algorithm algorithm,
+        float temperature,
+        float * confidence_scores) {
+    
+    if (!logits || !tokens || !confidence_scores) {
+        return -1;
+    }
+    
+    std::mt19937 gen(std::random_device{}());
+    int32_t mask_count = 0;
+    
+    // Initialize all confidence scores to 0
+    for (int32_t i = 0; i < n_tokens; i++) {
+        confidence_scores[i] = 0.0f;
+    }
+    
+    // Calculate confidence for each masked position
+    for (int32_t i = 0; i < n_tokens; i++) {
+        if (tokens[i] == mask_token_id) {
+            llama_token dummy_token;
+            confidence_scores[i] = calculate_token_confidence(
+                logits + i * n_vocab,
+                n_vocab,
+                algorithm,
+                temperature,
+                &dummy_token,
+                gen
+            );
+            mask_count++;
+        }
+    }
+    
+    return mask_count;
+}
+
+int32_t llama_diffusion_generate(
+        struct llama_context * ctx,
+        const llama_token * input_tokens,
+        int32_t n_input,
+        int32_t target_length,
+        llama_token * output_tokens,
+        struct llama_diffusion_params params) {
+    
+    if (!ctx || !input_tokens || !output_tokens || n_input < 0 || target_length <= n_input) {
+        return -1;
+    }
+    
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+    llama_token mask_token_id = llama_vocab_mask(vocab);
+    
+    if (mask_token_id == LLAMA_TOKEN_NULL) {
+        GGML_LOG_ERROR("%s: model does not have a mask token\n", __func__);
+        return -2;
+    }
+    
+    // Initialize random generator
+    std::mt19937 gen(params.seed == LLAMA_DEFAULT_SEED ? std::random_device{}() : params.seed);
+    
+    // Initialize sequence: copy input tokens and pad with mask tokens
+    std::vector<llama_token> tokens(target_length);
+    for (int32_t i = 0; i < n_input; i++) {
+        tokens[i] = input_tokens[i];
+    }
+    for (int32_t i = n_input; i < target_length; i++) {
+        tokens[i] = mask_token_id;
+    }
+    
+    // Set non-causal attention for masked language modeling
+    llama_set_causal_attn(ctx, false);
+    
+    // Create timestep schedule
+    std::vector<float> timesteps(params.steps + 1);
+    for (int32_t i = 0; i <= params.steps; i++) {
+        timesteps[i] = 1.0f - i * (1.0f - params.eps) / params.steps;
+    }
+    
+    if (params.verbose) {
+        GGML_LOG_INFO("%s: starting diffusion generation with %d steps\n", __func__, params.steps);
+    }
+    
+    // Diffusion generation loop
+    for (int32_t step = 0; step < params.steps; step++) {
+        float t = timesteps[step];
+        float s = timesteps[step + 1];
+        
+        // Count mask tokens
+        std::vector<int32_t> mask_indices;
+        for (int32_t i = 0; i < target_length; i++) {
+            if (tokens[i] == mask_token_id) {
+                mask_indices.push_back(i);
+            }
+        }
+        
+        if (mask_indices.empty()) {
+            if (params.verbose) {
+                GGML_LOG_INFO("%s: no more mask tokens to denoise at step %d\n", __func__, step);
+            }
+            break;
+        }
+        
+        // Prepare batch for full sequence
+        llama_batch batch = llama_batch_get_one(tokens.data(), target_length);
+        
+        // Decode
+        if (llama_decode(ctx, batch)) {
+            GGML_LOG_ERROR("%s: failed to decode at step %d\n", __func__, step);
+            return -3;
+        }
+        
+        // Get logits and apply Apple's logits shifting
+        float * logits = llama_get_logits(ctx);
+        int32_t n_vocab = llama_model_n_vocab(llama_get_model(ctx));
+        
+        // Apply Apple's logits shifting optimization
+        shift_logits_for_diffusion(logits, target_length, n_vocab);
+        
+        // Calculate confidence scores and sample tokens for masked positions
+        std::vector<std::pair<int32_t, float>> mask_confidences;
+        
+        for (int32_t idx : mask_indices) {
+            llama_token sampled_token;
+            float confidence = calculate_token_confidence(
+                logits + idx * n_vocab,
+                n_vocab,
+                params.algorithm,
+                params.temperature,
+                &sampled_token,
+                gen
+            );
+            
+            // Store index and confidence, pack sampled token in upper bits
+            mask_confidences.push_back({
+                (idx << 16) | sampled_token, 
+                confidence
+            });
+        }
+        
+        // Apply algorithmic temperature for confidence-based selection
+        if (params.alg_temperature > 0) {
+            // Convert confidences to probabilities using algorithmic temperature
+            std::vector<float> conf_probs(mask_confidences.size());
+            float max_conf = -INFINITY;
+            for (const auto& mc : mask_confidences) {
+                max_conf = std::max(max_conf, mc.second);
+            }
+            
+            float sum_exp = 0.0f;
+            for (size_t i = 0; i < mask_confidences.size(); i++) {
+                conf_probs[i] = expf((mask_confidences[i].second - max_conf) / params.alg_temperature);
+                sum_exp += conf_probs[i];
+            }
+            
+            for (float& p : conf_probs) {
+                p /= sum_exp;
+            }
+            
+            // Select tokens using confidence probabilities
+            int32_t num_unmask = static_cast<int32_t>(mask_indices.size() * (1.0f - s / t));
+            if (step == params.steps - 1) {
+                num_unmask = mask_indices.size(); // Unmask all remaining
+            }
+            
+            std::discrete_distribution<> conf_dist(conf_probs.begin(), conf_probs.end());
+            std::set<int32_t> selected_indices;
+            
+            for (int32_t i = 0; i < num_unmask && selected_indices.size() < mask_confidences.size(); i++) {
+                int32_t selected = conf_dist(gen);
+                if (selected_indices.find(selected) == selected_indices.end()) {
+                    selected_indices.insert(selected);
+                    int32_t idx = mask_confidences[selected].first >> 16;
+                    llama_token token = mask_confidences[selected].first & 0xFFFF;
+                    tokens[idx] = token;
+                }
+            }
+        } else {
+            // Deterministic selection: sort by confidence and take top tokens
+            std::sort(mask_confidences.begin(), mask_confidences.end(),
+                      [](const auto& a, const auto& b) { return a.second > b.second; });
+            
+            // Calculate number of tokens to unmask
+            int32_t num_unmask = static_cast<int32_t>(mask_indices.size() * (1.0f - s / t));
+            if (step == params.steps - 1) {
+                num_unmask = mask_indices.size(); // Unmask all remaining
+            }
+            
+            // Unmask the most confident tokens
+            for (int32_t i = 0; i < num_unmask && i < static_cast<int32_t>(mask_confidences.size()); i++) {
+                int32_t idx = mask_confidences[i].first >> 16;
+                llama_token token = mask_confidences[i].first & 0xFFFF;
+                tokens[idx] = token;
+            }
+        }
+        
+        if (params.verbose && ((step + 1) % 10 == 0 || step == params.steps - 1)) {
+            int32_t remaining_masks = 0;
+            for (int32_t i = 0; i < target_length; i++) {
+                if (tokens[i] == mask_token_id) remaining_masks++;
+            }
+            GGML_LOG_INFO("%s: step %d/%d, %.1f%% complete\n", 
+                         __func__, step + 1, params.steps,
+                         100.0f * (target_length - remaining_masks) / target_length);
+        }
+        
+        // Clear KV cache for next iteration
+        llama_kv_cache_clear(ctx);
+    }
+    
+    // Copy final result to output
+    for (int32_t i = 0; i < target_length; i++) {
+        output_tokens[i] = tokens[i];
+    }
+    
+    if (params.verbose) {
+        GGML_LOG_INFO("%s: diffusion generation complete\n", __func__);
+    }
+    
+    return target_length;
+}
+
 void llama_opt_init(struct llama_context * ctx, struct llama_model * model, struct llama_opt_params lopt_params) {
     ctx->opt_init(model, lopt_params);
 }
