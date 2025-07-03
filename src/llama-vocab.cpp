@@ -2962,6 +2962,10 @@ llama_token llama_vocab::token_pad() const {
     return pimpl->special_pad_id;
 }
 
+llama_token llama_vocab::token_mask() const {
+    return pimpl->special_mask_id;
+}
+
 llama_token llama_vocab::token_prefix() const {
     return pimpl->special_fim_pre_id;
 }
@@ -3200,6 +3204,10 @@ llama_token llama_vocab_nl (const struct llama_vocab * vocab) {
 
 llama_token llama_vocab_pad(const struct llama_vocab * vocab) {
     return vocab->token_pad();
+}
+
+llama_token llama_vocab_mask(const struct llama_vocab * vocab) {
+    return vocab->token_mask();
 }
 
 bool llama_vocab_get_add_bos(const struct llama_vocab * vocab) {
