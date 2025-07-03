@@ -1,5 +1,9 @@
 // Diffusion generation example for masked language models like DiffuCoder
+#include "arg.h"
+#include "common.h"
+#include "log.h"
 #include "llama.h"
+
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -7,6 +11,10 @@
 #include <cmath>
 #include <algorithm>
 #include <random>
+
+#if defined(_MSC_VER)
+#pragma warning(disable: 4244 4267) // possible loss of data
+#endif
 
 static void print_usage(int, char ** argv) {
     printf("\nexample usage:\n");
