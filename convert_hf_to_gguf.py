@@ -3200,6 +3200,11 @@ class DreamModel(Qwen2Model):
         # Add special vocabulary
         special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=False)
         special_vocab.merges = merges
+        
+        # Add mask token for diffusion models
+        if "<|mask|>" in combined_vocab:
+            special_vocab.special_token_ids["mask"] = combined_vocab["<|mask|>"]
+            
         special_vocab.add_to_gguf(self.gguf_writer)
 
 
