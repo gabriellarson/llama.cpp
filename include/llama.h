@@ -1044,6 +1044,7 @@ extern "C" {
     LLAMA_API llama_token llama_vocab_sep(const struct llama_vocab * vocab); // sentence separator
     LLAMA_API llama_token llama_vocab_nl (const struct llama_vocab * vocab); // next-line
     LLAMA_API llama_token llama_vocab_pad(const struct llama_vocab * vocab); // padding
+    LLAMA_API llama_token llama_vocab_mask(const struct llama_vocab * vocab); // mask
 
     LLAMA_API bool llama_vocab_get_add_bos(const struct llama_vocab * vocab);
     LLAMA_API bool llama_vocab_get_add_eos(const struct llama_vocab * vocab);
@@ -1445,6 +1446,65 @@ extern "C" {
     LLAMA_API struct llama_perf_sampler_data llama_perf_sampler      (const struct llama_sampler * chain);
     LLAMA_API void                           llama_perf_sampler_print(const struct llama_sampler * chain);
     LLAMA_API void                           llama_perf_sampler_reset(      struct llama_sampler * chain);
+
+    //
+    // diffusion models (non-autoregressive generation)
+    //
+
+    // diffusion algorithm types for confidence-based token selection
+    enum llama_diffusion_algorithm {
+        LLAMA_DIFFUSION_ORIGIN       = 0, // random selection
+        LLAMA_DIFFUSION_MASKGIT_PLUS = 1, // top-1 confidence
+        LLAMA_DIFFUSION_TOPK_MARGIN  = 2, // top-1 minus top-2
+        LLAMA_DIFFUSION_ENTROPY      = 3, // negative entropy
+    };
+
+    // parameters for diffusion generation
+    struct llama_diffusion_params {
+        int32_t                        steps;           // number of diffusion timesteps (default: 256)
+        float                          temperature;     // sampling temperature (default: 0.0)
+        float                          alg_temperature; // algorithmic temperature for confidence sampling (default: 0.0)
+        enum llama_diffusion_algorithm algorithm;       // confidence algorithm (default: LLAMA_DIFFUSION_ENTROPY)
+        float                          eps;             // timestep epsilon (default: 1e-3)
+        uint32_t                       seed;            // random seed (default: LLAMA_DEFAULT_SEED)
+        bool                           verbose;         // print generation progress (default: false)
+    };
+
+    // default diffusion parameters
+    LLAMA_API struct llama_diffusion_params llama_diffusion_default_params(void);
+
+    // generate text using diffusion (iterative denoising) instead of autoregressive generation
+    // input_tokens: array of tokens for the prompt (will be padded with mask tokens to target_length)
+    // n_input: number of input tokens in the prompt
+    // target_length: total desired sequence length (input + generated tokens)
+    // output_tokens: array to store the final generated sequence (must be allocated to target_length)
+    // returns: number of tokens in final sequence, or negative on error
+    LLAMA_API int32_t llama_diffusion_generate(
+              struct llama_context * ctx,
+        const llama_token *          input_tokens,
+              int32_t                n_input,
+              int32_t                target_length,
+              llama_token *          output_tokens,
+              struct llama_diffusion_params params);
+
+    // helper function to calculate confidence scores for tokens at masked positions
+    // logits: model output logits [n_tokens * n_vocab]
+    // tokens: current token sequence [n_tokens]
+    // n_tokens: sequence length
+    // mask_token_id: ID of the mask token
+    // algorithm: confidence scoring algorithm
+    // temperature: sampling temperature
+    // confidence_scores: output array for confidence scores [n_tokens] (only valid for masked positions)
+    // returns: number of masked positions found
+    LLAMA_API int32_t llama_diffusion_calculate_confidence(
+        const float *                    logits,
+        const llama_token *              tokens,
+              int32_t                    n_tokens,
+              int32_t                    n_vocab,
+              llama_token                mask_token_id,
+              enum llama_diffusion_algorithm algorithm,
+              float                      temperature,
+              float *                    confidence_scores);
 
     //
     // training
