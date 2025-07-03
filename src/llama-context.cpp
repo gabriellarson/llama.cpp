@@ -11,6 +11,10 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <random>
+#include <cmath>
+#include <set>
+#include <algorithm>
 
 //
 // llama_context
@@ -2987,7 +2991,7 @@ int32_t llama_diffusion_generate(
     llama_token mask_token_id = llama_vocab_mask(vocab);
     
     if (mask_token_id == LLAMA_TOKEN_NULL) {
-        GGML_LOG_ERROR("%s: model does not have a mask token\n", __func__);
+        LLAMA_LOG_ERROR("%s: model does not have a mask token\n", __func__);
         return -2;
     }
     
@@ -3013,7 +3017,7 @@ int32_t llama_diffusion_generate(
     }
     
     if (params.verbose) {
-        GGML_LOG_INFO("%s: starting diffusion generation with %d steps\n", __func__, params.steps);
+        LLAMA_LOG_INFO("%s: starting diffusion generation with %d steps\n", __func__, params.steps);
     }
     
     // Diffusion generation loop
@@ -3031,7 +3035,7 @@ int32_t llama_diffusion_generate(
         
         if (mask_indices.empty()) {
             if (params.verbose) {
-                GGML_LOG_INFO("%s: no more mask tokens to denoise at step %d\n", __func__, step);
+                LLAMA_LOG_INFO("%s: no more mask tokens to denoise at step %d\n", __func__, step);
             }
             break;
         }
@@ -3041,13 +3045,13 @@ int32_t llama_diffusion_generate(
         
         // Decode
         if (llama_decode(ctx, batch)) {
-            GGML_LOG_ERROR("%s: failed to decode at step %d\n", __func__, step);
+            LLAMA_LOG_ERROR("%s: failed to decode at step %d\n", __func__, step);
             return -3;
         }
         
         // Get logits and apply Apple's logits shifting
         float * logits = llama_get_logits(ctx);
-        int32_t n_vocab = llama_model_n_vocab(llama_get_model(ctx));
+        int32_t n_vocab = llama_n_vocab(llama_get_model(ctx));
         
         // Apply Apple's logits shifting optimization
         shift_logits_for_diffusion(logits, target_length, n_vocab);
@@ -3077,7 +3081,7 @@ int32_t llama_diffusion_generate(
         if (params.alg_temperature > 0) {
             // Convert confidences to probabilities using algorithmic temperature
             std::vector<float> conf_probs(mask_confidences.size());
-            float max_conf = -INFINITY;
+            float max_conf = -std::numeric_limits<float>::infinity();
             for (const auto& mc : mask_confidences) {
                 max_conf = std::max(max_conf, mc.second);
             }
@@ -3134,13 +3138,13 @@ int32_t llama_diffusion_generate(
             for (int32_t i = 0; i < target_length; i++) {
                 if (tokens[i] == mask_token_id) remaining_masks++;
             }
-            GGML_LOG_INFO("%s: step %d/%d, %.1f%% complete\n", 
+            LLAMA_LOG_INFO("%s: step %d/%d, %.1f%% complete\n", 
                          __func__, step + 1, params.steps,
                          100.0f * (target_length - remaining_masks) / target_length);
         }
         
-        // Clear KV cache for next iteration
-        llama_kv_cache_clear(ctx);
+        // Clear KV cache for next iteration  
+        llama_memory_clear(llama_get_memory(ctx), false);
     }
     
     // Copy final result to output
@@ -3149,7 +3153,7 @@ int32_t llama_diffusion_generate(
     }
     
     if (params.verbose) {
-        GGML_LOG_INFO("%s: diffusion generation complete\n", __func__);
+        LLAMA_LOG_INFO("%s: diffusion generation complete\n", __func__);
     }
     
     return target_length;
