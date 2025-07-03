@@ -3051,7 +3051,7 @@ int32_t llama_diffusion_generate(
         
         // Get logits and apply Apple's logits shifting
         float * logits = llama_get_logits(ctx);
-        int32_t n_vocab = llama_n_vocab(llama_get_model(ctx));
+        int32_t n_vocab = llama_vocab_n_tokens(vocab);
         
         // Apply Apple's logits shifting optimization
         shift_logits_for_diffusion(logits, target_length, n_vocab);
